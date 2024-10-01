@@ -1,0 +1,17 @@
+#!/usr/bin/env perl
+#
+# simple helper for TDP automation
+# prints date formatted mm/dd/yyyy like 10/01/2024 for 1 Oct 2024
+# used by expect script for tdposync purging all backups older then this date
+#
+use strict;
+use warnings;
+use Time::Piece;
+if ( $#ARGV == -1 or $ARGV[0] !~ /^\d+$/ ) {
+  print "Usage: $0 dd where dd is just days quantity to substract from today.\n";
+  exit 1;
+  }
+my $sSecs = 86400 * $ARGV[0];
+my $tsTS  = localtime( time() - $sSecs );
+printf( "%02d/%02d/%04d\n", $tsTS->mon, $tsTS->mday, $tsTS->year );
+exit 0;
