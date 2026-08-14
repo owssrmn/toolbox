@@ -6,12 +6,44 @@
 #
 use strict;
 use warnings;
-use Time::Piece;
-if ( $#ARGV == -1 or $ARGV[0] !~ /^\d+$/ ) {
-  print "Usage: $0 dd where dd is just days quantity to substract from today.\n";
+use POSIX qw(mktime strftime);
+
+my $_s_version="0.50"
+my $_s_authors="Ononole Wasserman, https://dmco.ru"
+
+sub usage {
+  print STDERR "Usage: $0 DAYS\n";
+  print STDERR "DAYS must be a non-negative integer.\n";
   exit 1;
-  }
-my $sSecs = 86400 * $ARGV[0];
-my $tsTS  = localtime( time() - $sSecs );
-printf( "%02d/%02d/%04d\n", $tsTS->mon, $tsTS->mday, $tsTS->year );
+}
+
+@ARGV == 1 or usage();
+
+my $s_days = $ARGV[0];
+$s_days =~ /\A[0-9]+\z/ or usage();
+
+my $i_days = 0 + $s_days;
+
+# Adjust this limit according to the actual retention policy.
+if ($i_days > 720) {
+  print STDERR "ERR: DAYS is unreasonably large: ${i_days}.\n";
+  exit 1;
+}
+
+my @a_local_time = localtime();
+
+# Noon avoids ambiguous or nonexistent local times around DST transitions.
+$a_local_time[2] = 12;
+$a_local_time[3] -= $i_days;
+$a_local_time[8] = -1;
+
+my $i_cutoff_epoch = mktime(@a_local_time);
+
+if (!defined($i_cutoff_epoch) || $i_cutoff_epoch == -1) {
+  print STDERR "ERR: cannot calculate the cutoff date.\n";
+  exit 2;
+}
+
+print strftime("%m/%d/%Y\n", localtime($i_cutoff_epoch));
 exit 0;
+
