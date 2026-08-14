@@ -1,0 +1,474 @@
+#!/usr/bin/ksh93
+
+typeset -r s_version="0.50"
+typeset -r s_authors="Ononole Wasserman, https://dmco.ru"
+typeset -r s_program_name="${0##*/}"
+typeset -r p_lock_dir="/var/run/clearswap.lock"
+
+# 0.10 - initial release
+# 0.12 - added 'auto' param
+# 0.14 - fixed validation via lsps, improved warnings, auto mode
+# 0.16 - exit codes fixed, uTimeout validation, auto mode safety check
+# 0.18 - extended safety check to 'do' mode
+# 0.20 - unified safety check: both modes require >= 2 active paging spaces
+# 0.22 - added paging usage table
+# 0.24 - replaced 'do'/'auto' with 'drain' subcommand; added -a/--all-active
+#        and -q/--quiet flags; removed 'auto' mode entirely
+# 0.30 - refactored to snake case and prefixes (we love them, we need them)
+# 0.40 - fixed exit handling and system-wide safety checks; added recovery,
+#        full argument validation, concurrent-run protection and a safe PATH
+# 0.41 - fixed invocation without arguments under ksh93 'set -u'
+# 0.42 - removed unsafe empty "$@" and array expansions under ksh93 'set -u'
+# 0.50 - improved paging space usage table; made signal cleanup direct and
+#        non-interruptible; hardened locale and locking; added explicit
+#        diagnostics for swapoff I/O errors
+#
+# exit code matrix
+#  0 - OK
+# 10 - usage error: no arguments provided
+# 11 - usage error: 'drain' without paging spaces and without -a
+# 12 - usage error: paging spaces specified with -a/--all-active
+# 13 - usage error: invalid subcommand or option
+# 14 - usage error: paging space does not exist
+# 15 - usage error: paging space specified more than once
+# 20 - environment error: not running on AIX
+# 21 - environment error: not running as root
+# 22 - environment error: cannot obtain paging space information
+# 23 - environment error: another instance may be running
+# 30 - safety error: fewer than 2 active paging spaces
+# 31 - safety error: no active paging spaces detected at all
+# 40 - operation error: swapoff failed
+# 41 - operation error: swapon failed
+# 42 - recovery error: could not reactivate a paging space during cleanup
+#129 - interrupted by SIGHUP
+#130 - interrupted by SIGINT
+#143 - interrupted by SIGTERM
+
+PATH=/usr/bin:/usr/sbin
+LC_ALL=C
+export PATH LC_ALL
+umask 077
+
+typeset i_timeout="${i_timeout:-2}"
+typeset s_disabled_ps=""
+typeset -i b_lock_held=0
+typeset -i i_ps_count=0
+typeset -a a_ps_names
+a_ps_names=()
+
+set -eu
+
+USAGE() {
+  cat << EOF
+This is ${s_program_name}.
+Version ${s_version} by ${s_authors}.
+This script drains (swapoff/swapon), one at a time, specified or all active
+paging spaces on AIX.
+
+Usage:
+  ${s_program_name} drain [-q] paging_space1 [paging_space2 ...]
+  or
+  ${s_program_name} drain [-q] -a | --all-active
+
+Options:
+  -q, --quiet       suppress paging space usage statistics
+                    reported before and after the operation
+  -a, --all-active  drain all currently active paging spaces
+
+Examples:
+  ${s_program_name} drain hd6 pg00 pg01
+  ${s_program_name} drain -q hd6 pg00 pg01
+  ${s_program_name} drain --all-active
+  ${s_program_name} drain -q -a
+
+BEWARE: Avoid running this script during periods of high paging activity.
+EOF
+}
+
+LOGG() {
+  typeset s_timestamp
+  s_timestamp="$(LANG=C date +"%y/%m/%d %T") "
+  printf '%s%s\n' "${s_timestamp}" "$*"
+}
+
+DIE() {
+  typeset s_message="${1:-}"
+  typeset -i i_exit_code="${2:-1}"
+
+  if [[ -n "${s_message}" ]]; then
+    LOGG "${s_message}" >&2
+  fi
+  exit "${i_exit_code}"
+}
+
+fn_validate_timeout() {
+  if ! [[ "${i_timeout}" =~ ^[0-9]+$ ]]; then
+    LOGG "WARN: got invalid timeout '${i_timeout}'; default value '2' will be used." >&2
+    i_timeout=2
+  fi
+}
+
+fn_ps_exists() {
+  typeset s_ps="${1}"
+  typeset s_ps_data
+
+  s_ps_data=$(lsps -ac 2>/dev/null) || return 2
+  printf '%s\n' "${s_ps_data}" | awk -F: -v s_name="${s_ps}" '
+    $1 == s_name { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+fn_ps_is_active() {
+  typeset s_ps="${1}"
+  typeset s_ps_data
+  typeset s_active
+
+  s_ps_data=$(lsps -ac 2>/dev/null) || return 2
+  s_active=$(printf '%s\n' "${s_ps_data}" | awk -F: -v s_name="${s_ps}" '
+    $1 == s_name { print $6; found=1 }
+    END { if (!found) exit 1 }
+  ') || return 1
+
+  [[ "${s_active}" == 'y' ]]
+}
+
+fn_get_active_ps_count() {
+  typeset s_ps_data
+
+  s_ps_data=$(lsps -ac 2>/dev/null) || return 1
+  printf '%s\n' "${s_ps_data}" | awk -F: '
+    $6 == "y" { count++ }
+    END { print count + 0 }
+  '
+}
+
+fn_check_safety() {
+  typeset s_count
+  typeset -i i_active_ps
+
+  if ! s_count=$(fn_get_active_ps_count); then
+    DIE "ERR: cannot obtain the list of active paging spaces." 22
+  fi
+  i_active_ps="${s_count}"
+
+  if ((i_active_ps == 0)); then
+    DIE "ERR: no active paging spaces detected." 31
+  fi
+  if ((i_active_ps < 2)); then
+    DIE "ERR: at least 2 active paging spaces are required; got ${i_active_ps}." 30
+  fi
+}
+
+fn_collect_all_active_ps() {
+  typeset s_ps_data
+  typeset s_ps
+  typeset s_active
+
+  if ! s_ps_data=$(lsps -ac 2>/dev/null); then
+    DIE "ERR: cannot obtain the list of paging spaces." 22
+  fi
+
+  a_ps_names=()
+  i_ps_count=0
+  while IFS=: read -r s_ps _ _ _ _ s_active _; do
+    if [[ "${s_active}" == 'y' ]]; then
+      a_ps_names[i_ps_count]="${s_ps}"
+      i_ps_count=$((i_ps_count + 1))
+    fi
+  done <<< "${s_ps_data}"
+}
+
+fn_validate_ps_names() {
+  typeset s_ps
+  typeset -i i_check_rc=0
+  typeset -i i_index=0
+
+  for ((i_index=0; i_index < i_ps_count; i_index++)); do
+    s_ps="${a_ps_names[i_index]}"
+    if fn_ps_exists "${s_ps}"; then
+      continue
+    else
+      i_check_rc=$?
+      if ((i_check_rc == 2)); then
+        DIE "ERR: cannot obtain the list of paging spaces." 22
+      fi
+      DIE "ERR: paging space '${s_ps}' does not exist." 14
+    fi
+  done
+}
+
+fn_show_ps_usage() {
+  typeset s_ps_data
+  typeset s_name
+  typeset s_used
+  typeset s_active
+  typeset s_active_text
+  typeset -i i_max_len=7  # length of "PS name"
+  typeset -i i_field_width
+
+  if ! s_ps_data=$(lsps -ac 2>/dev/null); then
+    DIE "ERR: cannot obtain paging space usage statistics." 22
+  fi
+
+  while IFS=: read -r s_name _ _ _ s_used s_active _; do
+    if [[ "${s_active}" != 'y' && "${s_active}" != 'n' ]]; then
+      continue
+    fi
+    if ((${#s_name} > i_max_len)); then
+      i_max_len=${#s_name}
+    fi
+  done <<< "${s_ps_data}"
+
+  i_field_width=${i_max_len}
+
+  LOGG "current paging space usage"
+  LOGG "$(printf "%${i_field_width}s   %4s   %s" \
+    "PS name" "used" "active")"
+
+  while IFS=: read -r s_name _ _ _ s_used s_active _; do
+    case "${s_active}" in
+      y) s_active_text="yes" ;;
+      n) s_active_text="no"  ;;
+      *) continue             ;;
+    esac
+
+    LOGG "$(printf "%${i_field_width}s : %03d%% : %s" \
+      "${s_name}" "${s_used}" "${s_active_text}")"
+  done <<< "${s_ps_data}"
+}
+
+fn_acquire_lock() {
+  typeset s_lock_owner="unknown"
+
+  if mkdir "${p_lock_dir}" 2>/dev/null; then
+    b_lock_held=1
+    printf '%s\n' "$$" > "${p_lock_dir}/pid"
+    return 0
+  fi
+
+  if [[ -r "${p_lock_dir}/pid" ]]; then
+    read -r s_lock_owner < "${p_lock_dir}/pid" || s_lock_owner="unknown"
+  fi
+  DIE "ERR: lock '${p_lock_dir}' already exists (PID ${s_lock_owner}); another instance may be running." 23
+}
+
+# shellcheck disable=SC2317,SC2329  # Invoked indirectly by trap
+_ON_EXIT() {
+  typeset -i i_exit_code="${1:-1}"
+  typeset -i i_recovery_rc=0
+
+  # Cleanup must not be interrupted by another catchable signal, and the
+  # EXIT trap must not invoke this function recursively.
+  trap '' HUP INT TERM
+  trap - EXIT
+  set +e
+
+  if [[ -n "${s_disabled_ps}" ]]; then
+    if fn_ps_is_active "${s_disabled_ps}"; then
+      LOGG "paging space '${s_disabled_ps}' is already active; no recovery is needed."
+      s_disabled_ps=""
+    else
+      LOGG "WARN: attempting to reactivate paging space '${s_disabled_ps}' during cleanup." >&2
+      swapon "/dev/${s_disabled_ps}"
+      i_recovery_rc=$?
+      if ((i_recovery_rc == 0)); then
+        LOGG "paging space '${s_disabled_ps}' was reactivated during cleanup."
+        s_disabled_ps=""
+      else
+        LOGG "ERR: could not reactivate paging space '${s_disabled_ps}' during cleanup (rc=${i_recovery_rc})." >&2
+        i_exit_code=42
+      fi
+    fi
+  fi
+
+  if ((b_lock_held == 1)); then
+    rm -f "${p_lock_dir}/pid" 2>/dev/null
+    if ! rmdir "${p_lock_dir}" 2>/dev/null; then
+      LOGG "WARN: could not remove lock directory '${p_lock_dir}'." >&2
+    fi
+  fi
+
+  exit "${i_exit_code}"
+}
+
+fn_process_ps() {
+  typeset s_ps="${1}"
+  typeset -i i_command_rc=0
+  typeset -i i_check_rc=0
+
+  LOGG "processing ${s_ps}..."
+
+  if fn_ps_exists "${s_ps}"; then
+    :
+  else
+    i_check_rc=$?
+    if ((i_check_rc == 2)); then
+      DIE "ERR: cannot obtain the list of paging spaces." 22
+    fi
+    DIE "ERR: paging space '${s_ps}' disappeared before processing." 14
+  fi
+
+  if fn_ps_is_active "${s_ps}"; then
+    :
+  else
+    i_check_rc=$?
+    if ((i_check_rc == 2)); then
+      DIE "ERR: cannot determine whether paging space '${s_ps}' is active." 22
+    fi
+    LOGG "WARN: paging space '${s_ps}' is already inactive; skipping it." >&2
+    LOGG "finished processing ${s_ps}: skipped."
+    return 0
+  fi
+
+  # Re-check immediately before every swapoff: the system state may have
+  # changed since the initial validation.
+  fn_check_safety
+
+  # Mark the paging space before invoking swapoff. If a signal arrives while
+  # the foreground command is running, cleanup will verify its actual state
+  # and reactivate it if necessary.
+  s_disabled_ps="${s_ps}"
+  if swapoff "/dev/${s_ps}"; then
+    :
+  else
+    i_command_rc=$?
+    s_disabled_ps=""
+    case "${i_command_rc}" in
+      3)
+        DIE "CRIT: swapoff suspended for '${s_ps}': I/O errors on user backing pages; check the error log and reboot (rc=3)." 40
+        ;;
+      4)
+        DIE "CRIT: swapoff suspended for '${s_ps}': I/O errors on system backing pages; the system may crash; check the error log and reboot (rc=4)." 40
+        ;;
+      *)
+        DIE "ERR: swapoff failed for '${s_ps}' (rc=${i_command_rc})." 40
+        ;;
+    esac
+  fi
+
+  sleep "${i_timeout}"
+
+  if swapon "/dev/${s_ps}"; then
+    s_disabled_ps=""
+  else
+    i_command_rc=$?
+    DIE "ERR: swapon failed for '${s_ps}' (rc=${i_command_rc})." 41
+  fi
+
+  sleep "${i_timeout}"
+  LOGG "finished processing ${s_ps}."
+}
+
+fn_main() {
+  typeset s_arg
+  typeset s_ps
+  typeset -i b_quiet=0
+  typeset -i b_all_active=0
+  typeset -i i_index=0
+  typeset -A m_seen_ps
+
+  if [[ "$(uname)" != 'AIX' ]]; then
+    DIE "ERR: usable under AIX only." 20
+  fi
+  if [[ "$(id -u)" != '0' ]]; then
+    DIE "ERR: must be root." 21
+  fi
+
+  fn_validate_timeout
+
+  if (($# == 0)); then
+    USAGE >&2
+    DIE '' 10
+  fi
+
+  case "${1}" in
+    -h|--help)
+      USAGE
+      return 0
+      ;;
+    drain)
+      shift
+      ;;
+    *)
+      USAGE >&2
+      DIE "ERR: unknown subcommand '${1}'; use 'drain'." 13
+      ;;
+  esac
+
+  i_ps_count=0
+  a_ps_names=()
+  while (($# > 0)); do
+    s_arg="${1}"
+    shift
+    case "${s_arg}" in
+      -q|--quiet)
+        b_quiet=1
+        ;;
+      -a|--all-active)
+        b_all_active=1
+        ;;
+      -*)
+        USAGE >&2
+        DIE "ERR: unknown option '${s_arg}'." 13
+        ;;
+      *)
+        if [[ -n "${m_seen_ps[${s_arg}]-}" ]]; then
+          DIE "ERR: paging space '${s_arg}' was specified more than once." 15
+        fi
+        m_seen_ps[${s_arg}]=1
+        a_ps_names[i_ps_count]="${s_arg}"
+        i_ps_count=$((i_ps_count + 1))
+        ;;
+    esac
+  done
+
+  if ((i_ps_count > 0 && b_all_active == 1)); then
+    USAGE >&2
+    DIE "ERR: cannot specify paging spaces with -a/--all-active." 12
+  fi
+  if ((i_ps_count == 0 && b_all_active == 0)); then
+    USAGE >&2
+    DIE "ERR: 'drain' requires paging space names or -a/--all-active." 11
+  fi
+
+  fn_acquire_lock
+
+  if ((b_all_active == 1)); then
+    fn_collect_all_active_ps
+  else
+    fn_validate_ps_names
+  fi
+
+  # This count is system-wide, not limited to the requested paging spaces.
+  fn_check_safety
+
+  if ((b_quiet == 0)); then
+    fn_show_ps_usage
+  fi
+
+  if ((i_ps_count > 0)); then
+    for ((i_index=0; i_index < i_ps_count; i_index++)); do
+      s_ps="${a_ps_names[i_index]}"
+      fn_process_ps "${s_ps}"
+    done
+  fi
+
+  if ((b_quiet == 0)); then
+    fn_show_ps_usage
+  fi
+
+  return 0
+}
+
+trap '_ON_EXIT 129' HUP
+trap '_ON_EXIT 130' INT
+trap '_ON_EXIT 143' TERM
+trap '_ON_EXIT $?' EXIT
+
+if (($# == 0)); then
+  fn_main
+else
+  fn_main "$@"
+fi
+exit 0
